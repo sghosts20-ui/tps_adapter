@@ -2,7 +2,7 @@
  * ============================================================
  *  TPS Adapter — Нештатный ДПДЗ → Блок управления АКПП
  *  Arduino Nano (АЦП) + PCF8591 (ЦАП)
- *  v1.3 — управление через Serial-терминал
+ *  v1.4 — управление через Serial-терминал
  * ============================================================
  *
  *  СХЕМА ПОДКЛЮЧЕНИЯ:
@@ -15,14 +15,18 @@
  *  │ PCF8591 VDD   → 5V Arduino                              │
  *  │ PCF8591 GND   → Общая масса                             │
  *  │ PCF8591 VREF  → 5V от блока АКПП (питание датчика)     │
- *  │ PCF8591 AOUT  → Вход ДПДЗ на блок АКПП                 │
+ *  │ PCF8591 AOUT  → буфер ОУ → вход ДПДЗ на блок АКПП     │
  *  │ PCF8591 A0-A2 → GND  (I²C адрес 0x48)                  │
+ *  │                                                         │
+ *  │ ⚠ YL-40: снять LED на AOUT + перемычки P4/P5/P6.       │
+ *  │   Без буфера ОУ AOUT «кривой»: ~1.9В..3.3В вместо 0..5В│
  *  └─────────────────────────────────────────────────────────┘
  *
  *  КОМАНДЫ (115200 baud, line ending: Newline):
  *    v   — разово: текущее входное напряжение ДПДЗ
  *    vs  — вкл/выкл потоковый вывод (повторно — выкл)
  *    d   — диагностика PCF8591 / I²C
+ *    t   — тест ЦАП (DAC=0/128/255/24/233) — мерять AOUT мультиметром
  *    c   — калибровка (2 шага с подсказками)
  *    s   — показать текущую калибровку
  *    r   — сброс в заводские умолчания
@@ -163,10 +167,72 @@ void printHelp() {
   Serial.println(F("    v   — разово: текущее Vin ДПДЗ"));
   Serial.println(F("    vs  — вкл/выкл потоковый вывод"));
   Serial.println(F("    d   — диагностика PCF8591 / I2C"));
+  Serial.println(F("    t   — тест ЦАП (мультиметр на AOUT)"));
   Serial.println(F("    c   — калибровка"));
   Serial.println(F("    s   — показать калибровку"));
   Serial.println(F("    r   — сброс в умолчания"));
   Serial.println(F("    h   — эта справка"));
+}
+
+// Ждём Enter, пока держим DAC и сбрасываем WDT
+void waitEnterHoldDac(uint8_t dacVal) {
+  while (Serial.available()) Serial.read();
+  while (true) {
+    wdt_reset();
+    dacWrite(dacVal);
+    if (Serial.available()) {
+      char c = (char)Serial.read();
+      if (c == '\n' || c == '\r') break;
+    }
+  }
+  uint32_t t = millis();
+  while (millis() - t < 30) {
+    wdt_reset();
+    while (Serial.available()) Serial.read();
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  t — тест выхода ЦАП (железо)
+// ═══════════════════════════════════════════════════════════════
+// Норма после снятия LED + буфера ОУ:
+//   DAC=0   → ~0.0 В
+//   DAC=255 → ~VREF (≈5.0 В)
+// Если видите ~1.9В..3.3В — AOUT нагружен (LED YL-40) / нет буфера.
+void runDacTest() {
+  bool wasStream = streamOn;
+  streamOn = false;
+
+  Serial.println(F("\n  ┌─ Тест ЦАП (мультиметр на AOUT ↔ GND) ────┐"));
+  Serial.println(F("  │ Ожидание (идеал, VREF=5В):                 │"));
+  Serial.println(F("  │   DAC=0   → ~0.00 В                        │"));
+  Serial.println(F("  │   DAC=128 → ~2.50 В                        │"));
+  Serial.println(F("  │   DAC=255 → ~5.00 В                        │"));
+  Serial.println(F("  │   DAC=24  → ~0.47 В  (закрыта АКПП)        │"));
+  Serial.println(F("  │   DAC=233 → ~4.57 В  (открыта АКПП)        │"));
+  Serial.println(F("  │ Если 0→~1.9В и 255→~3.3В — железо YL-40:   │"));
+  Serial.println(F("  │   1) отпаять LED на AOUT                   │"));
+  Serial.println(F("  │   2) буфер rail-to-rail ОУ (повторитель)   │"));
+  Serial.println(F("  │   3) VREF = 5В датчика АКПП                │"));
+  Serial.println(F("  │ Софт это НЕ исправит — диапазон слишком узкий│"));
+  Serial.println(F("  └──────────────────────────────────────────────┘"));
+
+  const uint8_t codes[] = { 0, 128, 255, DAC_CLOSED, DAC_OPEN };
+  const char*   names[] = { "DAC=0   (~0.00V)", "DAC=128 (~2.50V)",
+                            "DAC=255 (~5.00V)", "DAC=24  (~0.47V)",
+                            "DAC=233 (~4.57V)" };
+
+  for (uint8_t i = 0; i < 5; i++) {
+    Serial.println();
+    Serial.print(F("  >>> "));
+    Serial.print(names[i]);
+    Serial.println(F("  — измерьте AOUT, затем Enter"));
+    waitEnterHoldDac(codes[i]);
+  }
+
+  dacWrite(DAC_CLOSED);
+  Serial.println(F("\n  Тест ЦАП завершён. Выход = DAC_CLOSED.\n"));
+  streamOn = wasStream;
 }
 
 
@@ -288,6 +354,8 @@ void runDiagnostics() {
   Serial.print(F("  │ Поток (vs): "));
   Serial.println(streamOn ? F("ВКЛ                         │")
                           : F("ВЫКЛ                        │"));
+  Serial.println(F("  │ Подсказка: если AOUT ~1.9..3.3В на 0..255 —│"));
+  Serial.println(F("  │   отпаять LED AOUT + буфер ОУ. Команда: t   │"));
   Serial.println(F("  └──────────────────────────────────────────────┘"));
 }
 
@@ -411,6 +479,9 @@ void handleCommand(char *cmd) {
   else if (strcmp(cmd, "d") == 0) {
     runDiagnostics();
   }
+  else if (strcmp(cmd, "t") == 0) {
+    runDacTest();
+  }
   else if (strcmp(cmd, "c") == 0) {
     runCalibration();
   }
@@ -443,7 +514,7 @@ void setup() {
   dacWrite(DAC_CLOSED);
 
   Serial.println(F("\n╔══════════════════════════════════════╗"));
-  Serial.println(F("║   TPS Adapter v1.3  (ДПДЗ → АКПП)   ║"));
+  Serial.println(F("║   TPS Adapter v1.4  (ДПДЗ → АКПП)   ║"));
   Serial.println(F("╚══════════════════════════════════════╝"));
 
   loadCalibration();
