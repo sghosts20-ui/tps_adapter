@@ -2,8 +2,14 @@
  * ============================================================
  *  TPS Adapter — Нештатный ДПДЗ → Блок управления АКПП
  *  Arduino Nano (АЦП) + PCF8591 (ЦАП)
- *  v1.6 — управление через Serial-терминал
+ *  v1.7 — рабочий / сервисный режим
  * ============================================================
+ *
+ *  РЕЖИМЫ (выбираются при включении):
+ *    D2 и D3 разомкнуты → РАБОЧИЙ: только A0 → ЦАП, без Serial.
+ *    D2 и D3 замкнуты   → СЕРВИСНЫЙ: терминал, калибровка,
+ *                          диагностика, мониторинг A1.
+ *  Смена режима — только перезагрузкой.
  *
  *  СХЕМА ПОДКЛЮЧЕНИЯ:
  *  ┌─────────────────────────────────────────────────────────┐
@@ -54,6 +60,10 @@ const uint8_t PCF_ADDR = 0x48;
 const uint8_t PIN_TPS = A0;   // вход нештатного ДПДЗ
 const uint8_t PIN_FB  = A1;   // обратная связь: факт AOUT
 
+// ─── Перемычка сервисного режима ──────────────────────────────
+const uint8_t PIN_JMP_IN  = 2;
+const uint8_t PIN_JMP_OUT = 3;
+
 // ─── ВЫХОДНОЙ ДИАПАЗОН ────────────────────────────────────────
 // Родной ДПДЗ АКПП: 0.47В закрыта, 4.57В открыта, VREF = 5В
 const uint8_t DAC_CLOSED = 24;   // 0.47 / 5.0 * 255 ≈ 24
@@ -76,6 +86,7 @@ bool    holdDac   = false;   // удержание фиксированного 
 uint8_t holdValue = DAC_CLOSED;
 uint16_t i2cFailCount = 0;
 uint8_t  lastDacCode  = 0xFF;
+bool     serviceMode  = false;
 
 
 // ═══════════════════════════════════════════════════════════════
@@ -110,13 +121,45 @@ uint8_t dacWrite(uint8_t v) {
     err = Wire.endTransmission();
     if (err != 0) {
       i2cFailCount++;
-      // мягкий рестарт шины при сбое
-      Wire.begin();
-      Wire.setClock(100000);
+      i2cInit();
     }
   }
   lastDacCode = v;
   return err;
+}
+
+void i2cInit() {
+  Wire.begin();
+  Wire.setClock(100000);   // PCF8591 рассчитан на 100 кГц
+#if defined(WIRE_HAS_TIMEOUT)
+  Wire.setWireTimeout(3000, true);
+#endif
+}
+
+// Рабочий режим: одна запись, при сбое — переинициализация шины
+void dacWriteFast(uint8_t v) {
+  Wire.beginTransmission(PCF_ADDR);
+  Wire.write(0x40);
+  Wire.write(v);
+  if (Wire.endTransmission() != 0) i2cInit();
+}
+
+// Проверка перемычки D2–D3: D3 дёргаем, D2 должен повторять.
+// Так D2, случайно замкнутый на GND, не включит сервисный режим.
+bool serviceJumperPresent() {
+  pinMode(PIN_JMP_IN, INPUT_PULLUP);
+  pinMode(PIN_JMP_OUT, OUTPUT);
+  bool ok = true;
+  for (uint8_t i = 0; i < 4 && ok; i++) {
+    digitalWrite(PIN_JMP_OUT, LOW);
+    delayMicroseconds(100);
+    if (digitalRead(PIN_JMP_IN) != LOW) ok = false;
+    digitalWrite(PIN_JMP_OUT, HIGH);
+    delayMicroseconds(100);
+    if (digitalRead(PIN_JMP_IN) != HIGH) ok = false;
+  }
+  pinMode(PIN_JMP_OUT, INPUT_PULLUP);
+  return ok;
 }
 
 void setDacHold(uint8_t v, bool on) {
@@ -161,16 +204,21 @@ const __FlashStringHelper* i2cErrorStr(uint8_t err) {
 //  EEPROM
 // ═══════════════════════════════════════════════════════════════
 
-void loadCalibration() {
+// Без вывода в Serial — вызывается и в рабочем режиме.
+// false = нет данных или они битые, остаются умолчания.
+bool loadCalibration() {
   uint16_t magic;
   EEPROM.get(EE_MAGIC, magic);
-  if (magic != MAGIC_VAL) {
-    Serial.println(F("  [EEPROM] Нет данных — загружены умолчания"));
-    return;
-  }
-  EEPROM.get(EE_RCLOSED, rawClosed);
-  EEPROM.get(EE_ROPEN,   rawOpen);
-  Serial.println(F("  [EEPROM] Калибровка загружена"));
+  if (magic != MAGIC_VAL) return false;
+
+  int16_t c, o;
+  EEPROM.get(EE_RCLOSED, c);
+  EEPROM.get(EE_ROPEN,   o);
+  if (c < 0 || c > 1023 || o < 0 || o > 1023 || abs(o - c) < 50) return false;
+
+  rawClosed = c;
+  rawOpen   = o;
+  return true;
 }
 
 void saveCalibration() {
@@ -485,8 +533,7 @@ void runDiagnostics() {
   Serial.println(F("  └──────────────────────────────────────────────┘"));
 
   // после скана шины — гарантированно вернуть ЦАП
-  Wire.begin();
-  Wire.setClock(100000);
+  i2cInit();
   dacWrite(holdDac ? holdValue : DAC_CLOSED);
 }
 
@@ -652,26 +699,46 @@ void handleCommand(char *cmd) {
 // ═══════════════════════════════════════════════════════════════
 
 void setup() {
-  Serial.begin(115200);
-  Wire.begin();
-  Wire.setClock(100000);
+  wdt_disable();
+  i2cInit();
+  dacWriteFast(DAC_CLOSED);
 
-  dacWrite(DAC_CLOSED);
+  bool calOk  = loadCalibration();
+  serviceMode = serviceJumperPresent();
 
-  Serial.println(F("\n╔══════════════════════════════════════╗"));
-  Serial.println(F("║   TPS Adapter v1.6  (ДПДЗ → АКПП)   ║"));
-  Serial.println(F("╚══════════════════════════════════════╝"));
-
-  loadCalibration();
-  printCalibration();
-  printHelp();
-  Serial.println(F("  (A1=ОС AOUT; поток — vs; удержание — t0/t255)\n"));
+  if (serviceMode) {
+    Serial.begin(115200);
+    Serial.println(F("\n╔══════════════════════════════════════╗"));
+    Serial.println(F("║   TPS Adapter v1.7  СЕРВИСНЫЙ РЕЖИМ  ║"));
+    Serial.println(F("╚══════════════════════════════════════╝"));
+    Serial.println(calOk ? F("  [EEPROM] Калибровка загружена")
+                         : F("  [EEPROM] Нет данных — загружены умолчания"));
+    printCalibration();
+    printHelp();
+    Serial.println(F("  (A1=ОС AOUT; поток — vs; удержание — t0/t255)"));
+    Serial.println(F("  Рабочий режим: снять перемычку D2-D3 и перезагрузить\n"));
+  }
 
   wdt_enable(WDTO_250MS);
 }
 
+// Рабочий режим: вход → ЦАП, ничего лишнего.
+// Цикл ≈ 0.75 мс (4 замера АЦП ≈ 0.45 мс + запись I2C ≈ 0.3 мс).
+void fastLoop() {
+  uint16_t s = analogRead(PIN_TPS);
+  s += analogRead(PIN_TPS);
+  s += analogRead(PIN_TPS);
+  s += analogRead(PIN_TPS);
+  dacWriteFast(computeDAC((int16_t)(s >> 2)));
+}
+
 void loop() {
   wdt_reset();
+
+  if (!serviceMode) {
+    fastLoop();
+    return;
+  }
 
   // ── Чтение строки команды до \n / \r ────────────────────────
   static char   cmdBuf[16];
