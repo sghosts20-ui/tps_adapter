@@ -2,7 +2,7 @@
  * ============================================================
  *  TPS Adapter — Нештатный ДПДЗ → Блок управления АКПП
  *  Arduino Nano (АЦП) + PCF8591 (ЦАП)
- *  v1.2 — управление через Serial-терминал
+ *  v1.3 — управление через Serial-терминал
  * ============================================================
  *
  *  СХЕМА ПОДКЛЮЧЕНИЯ:
@@ -20,39 +20,40 @@
  *  └─────────────────────────────────────────────────────────┘
  *
  *  КОМАНДЫ (115200 baud, line ending: Newline):
- *    v  — живой мониторинг входного напряжения ДПДЗ (бар + направление)
- *    c  — калибровка (2 шага с подсказками)
- *    s  — показать текущую калибровку
- *    r  — сброс в заводские умолчания
- *    h  — помощь
- *
- *  В режиме мониторинга каждые 250 мс выводится:
- *    ADC_in=NNN  TPS=NN.N%  DAC=NNN  Vout≈N.NNV
+ *    v   — разово: текущее входное напряжение ДПДЗ
+ *    vs  — вкл/выкл потоковый вывод (повторно — выкл)
+ *    d   — диагностика PCF8591 / I²C
+ *    c   — калибровка (2 шага с подсказками)
+ *    s   — показать текущую калибровку
+ *    r   — сброс в заводские умолчания
+ *    h   — помощь
  * ============================================================
  */
 
 #include <Wire.h>
 #include <EEPROM.h>
 #include <avr/wdt.h>
+#include <string.h>
+#include <ctype.h>
 
 // ─── PCF8591 ─────────────────────────────────────────────────
 const uint8_t PCF_ADDR = 0x48;
 
 // ─── ВЫХОДНОЙ ДИАПАЗОН ────────────────────────────────────────
 // Родной ДПДЗ АКПП: 0.47В закрыта, 4.57В открыта, VREF = 5В
-// DAC = V / 5.0 * 255
-const uint8_t DAC_CLOSED = 24;   // 0.47 / 5.0 * 255 = 23.97
-const uint8_t DAC_OPEN   = 233;  // 4.57 / 5.0 * 255 = 233.07
+const uint8_t DAC_CLOSED = 24;   // 0.47 / 5.0 * 255 ≈ 24
+const uint8_t DAC_OPEN   = 233;  // 4.57 / 5.0 * 255 ≈ 233
 
 // ─── EEPROM ───────────────────────────────────────────────────
-const uint16_t EE_MAGIC   = 0;   // uint16_t
-const uint16_t EE_RCLOSED = 2;   // int16_t
-const uint16_t EE_ROPEN   = 4;   // int16_t
+const uint16_t EE_MAGIC   = 0;
+const uint16_t EE_RCLOSED = 2;
+const uint16_t EE_ROPEN   = 4;
 const uint16_t MAGIC_VAL  = 0xDA7B;
 
-// ─── КАЛИБРОВОЧНЫЕ ДАННЫЕ ─────────────────────────────────────
-int16_t rawClosed = 51;    // умолчание — нормальный датчик
-int16_t rawOpen   = 972;   // rawClosed > rawOpen = инвертированный
+// ─── Состояние ────────────────────────────────────────────────
+int16_t rawClosed = 51;
+int16_t rawOpen   = 972;
+bool    streamOn  = false;   // потоковый вывод (команда vs)
 
 
 // ═══════════════════════════════════════════════════════════════
@@ -65,11 +66,12 @@ int16_t readTPS() {
   return (int16_t)(s >> 3);
 }
 
-void dacWrite(uint8_t v) {
+// Возвращает код endTransmission(): 0 = OK
+uint8_t dacWrite(uint8_t v) {
   Wire.beginTransmission(PCF_ADDR);
   Wire.write(0x40);
   Wire.write(v);
-  Wire.endTransmission();
+  return Wire.endTransmission();
 }
 
 uint8_t computeDAC(int16_t raw) {
@@ -80,6 +82,17 @@ uint8_t computeDAC(int16_t raw) {
               / span
               + DAC_CLOSED;
   return (uint8_t)constrain(y, (int32_t)DAC_CLOSED, (int32_t)DAC_OPEN);
+}
+
+const __FlashStringHelper* i2cErrorStr(uint8_t err) {
+  switch (err) {
+    case 0: return F("OK");
+    case 1: return F("переполнение буфера");
+    case 2: return F("NACK на адрес (устройство не отвечает)");
+    case 3: return F("NACK на данные");
+    case 4: return F("ошибка шины / другое");
+    default: return F("неизвестный код");
+  }
 }
 
 
@@ -109,7 +122,6 @@ void saveCalibration() {
 void resetCalibration() {
   rawClosed = 51;
   rawOpen   = 972;
-  // Стираем EEPROM — записываем невалидную сигнатуру
   EEPROM.put(EE_MAGIC, (uint16_t)0xFFFF);
   Serial.println(F("  Сброшено в умолчания (EEPROM очищен)"));
 }
@@ -148,114 +160,135 @@ void printCalibration() {
 
 void printHelp() {
   Serial.println(F("  Команды:"));
-  Serial.println(F("    v  — мониторинг Vin ДПДЗ (бар + направление, выход — любая клавиша)"));
-  Serial.println(F("    c  — калибровка"));
-  Serial.println(F("    s  — показать калибровку"));
-  Serial.println(F("    r  — сброс в умолчания"));
-  Serial.println(F("    h  — эта справка"));
-}
-
-// ═══════════════════════════════════════════════════════════════
-//  ЖИВОЙ МОНИТОРИНГ ВХОДНОГО НАПРЯЖЕНИЯ
-// ═══════════════════════════════════════════════════════════════
-
-// Показывает входное напряжение ДПДЗ в виде бар-графа и стрелки
-// направления — чтобы понять нормальный датчик или инвертированный.
-// Выход — любая клавиша.
-void showVoltageMonitor() {
-  Serial.println(F("\n  Мониторинг Vin ДПДЗ  (любая клавиша — выход)"));
-  Serial.println(F("  Двигайте заслонку и смотрите направление стрелки:"));
-  Serial.println(F("  нормальный: закрыта=низкое V, открыта=высокое V  (^)"));
-  Serial.println(F("  инверсный : закрыта=высокое V, открыта=низкое V  (v)\n"));
-  while (Serial.available()) Serial.read();
-
-  int16_t prev   = readTPS();
-  uint32_t tNext = 0;
-
-  for (;;) {
-    wdt_reset();
-    if (Serial.available()) break;
-
-    if (millis() >= tNext) {
-      tNext = millis() + 100;
-
-      int16_t raw = readTPS();
-      float   v   = (float)raw / 1023.0f * 5.0f;
-
-      // Определяем направление (гистерезис ±3 ед.)
-      char dir;
-      if      (raw > prev + 3) dir = '^';
-      else if (raw < prev - 3) dir = 'v';
-      else                     dir = '=';
-      prev = raw;
-
-      // Бар-граф 30 символов: заполнение пропорционально raw/1023
-      uint8_t fill = (uint32_t)raw * 30 / 1023;
-
-      Serial.print(F("\r  ADC="));
-      // выравниваем по 4 разряда
-      if (raw < 1000) Serial.print(' ');
-      if (raw < 100)  Serial.print(' ');
-      if (raw < 10)   Serial.print(' ');
-      Serial.print(raw);
-      Serial.print(F("  Vin="));
-      Serial.print(v, 3);
-      Serial.print(F("V  ["));
-      for (uint8_t i = 0; i < 30; i++) {
-        if (i < fill)       Serial.print('=');
-        else if (i == fill) Serial.print('|');
-        else                Serial.print(' ');
-      }
-      Serial.print(F("]  "));
-      if      (dir == '^') Serial.print(F("РАСТЁТ ^ "));
-      else if (dir == 'v') Serial.print(F("ПАДАЕТ v "));
-      else                 Serial.print(F("стоит  = "));
-    }
-  }
-
-  while (Serial.available()) Serial.read();
-  Serial.println(F("\n\n  Выход из мониторинга\n"));
+  Serial.println(F("    v   — разово: текущее Vin ДПДЗ"));
+  Serial.println(F("    vs  — вкл/выкл потоковый вывод"));
+  Serial.println(F("    d   — диагностика PCF8591 / I2C"));
+  Serial.println(F("    c   — калибровка"));
+  Serial.println(F("    s   — показать калибровку"));
+  Serial.println(F("    r   — сброс в умолчания"));
+  Serial.println(F("    h   — эта справка"));
 }
 
 
 // ═══════════════════════════════════════════════════════════════
-//  ОЖИДАНИЕ СТРОКИ ИЗ SERIAL (с wdt_reset)
+//  v — разовое значение Vin
 // ═══════════════════════════════════════════════════════════════
 
-// Блокирует выполнение до прихода '\n' или '\r'.
-// Всё время сбрасывает watchdog и поддерживает DAC.
-// Возвращает первый непробельный символ строки (или '\0').
-char waitLine(int16_t *dacRawForKeepAlive = nullptr) {
-  // Сбросить буфер
-  while (Serial.available()) Serial.read();
+void printVinOnce() {
+  int16_t raw = readTPS();
+  float   vin = (float)raw / 1023.0f * 5.0f;
+  uint8_t dac = computeDAC(raw);
+  float   vout = (float)dac / 255.0f * 5.0f;
 
-  char first = '\0';
-  bool gotFirst = false;
+  int32_t span = (int32_t)rawOpen - rawClosed;
+  float pct = (span == 0)
+                ? 0.0f
+                : (float)(raw - rawClosed) * 100.0f / (float)span;
+  pct = constrain(pct, 0.0f, 100.0f);
 
-  while (true) {
+  Serial.print(F("  ADC="));  Serial.print(raw);
+  Serial.print(F("  Vin="));  Serial.print(vin, 3); Serial.print(F("V"));
+  Serial.print(F("  TPS="));  Serial.print(pct, 1); Serial.print(F("%"));
+  Serial.print(F("  DAC="));  Serial.print(dac);
+  Serial.print(F("  Vout≈")); Serial.print(vout, 2); Serial.println(F("V"));
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+//  d — диагностика PCF8591
+// ═══════════════════════════════════════════════════════════════
+
+void runDiagnostics() {
+  Serial.println(F("  ┌─ Диагностика PCF8591 / I2C ───────────────┐"));
+
+  // 1) Скан шины 0x08..0x77
+  Serial.println(F("  │ Скан I2C...                                │"));
+  uint8_t found = 0;
+  bool    pcfFound = false;
+  uint8_t pcfAlt = 0;   // другой адрес семейства 0x48..0x4B
+
+  for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
     wdt_reset();
-
-    // Поддерживаем DAC живым
-    if (dacRawForKeepAlive) {
-      dacWrite(computeDAC(*dacRawForKeepAlive));
-    }
-
-    if (Serial.available()) {
-      char c = (char)Serial.read();
-      if (c == '\n' || c == '\r') {
-        if (gotFirst) break;   // получили завершение строки
-      } else {
-        if (!gotFirst) { first = c; gotFirst = true; }
+    Wire.beginTransmission(addr);
+    uint8_t err = Wire.endTransmission();
+    if (err == 0) {
+      found++;
+      Serial.print(F("  │   найден: 0x"));
+      if (addr < 0x10) Serial.print('0');
+      Serial.print(addr, HEX);
+      if (addr == PCF_ADDR) {
+        Serial.print(F("  ← PCF8591 (ожидаемый)"));
+        pcfFound = true;
+      } else if (addr >= 0x48 && addr <= 0x4B) {
+        Serial.print(F("  ← возможен PCF8591 (A0-A2)"));
+        pcfAlt = addr;
       }
+      Serial.println();
+      Serial.print(F("  │"));
+      // выравнивание строки таблицы — просто перевод
+      // (следующий println уже есть выше; печатаем пустую для формата)
     }
   }
-  // Ждём, пока уйдёт весь возможный мусор (\r\n или \n\r)
-  uint32_t t = millis();
-  while (millis() - t < 30) {
-    wdt_reset();
-    while (Serial.available()) Serial.read();
+
+  if (found == 0) {
+    Serial.println(F("  │   устройств не найдено                     │"));
+    Serial.println(F("  │   Проверьте: SDA/SCL, питание, GND, pull-up │"));
+  } else {
+    Serial.print(F("  │ Всего на шине: "));
+    Serial.print(found);
+    Serial.println(F(" устр.                        │"));
   }
-  return first;
+
+  // 2) Проверка ожидаемого адреса
+  Serial.print(F("  │ Адрес 0x48: "));
+  Wire.beginTransmission(PCF_ADDR);
+  uint8_t errProbe = Wire.endTransmission();
+  if (errProbe == 0) {
+    Serial.println(F("ОБНАРУЖЕН                    │"));
+  } else {
+    Serial.print(F("НЕ ОБНАРУЖЕН ("));
+    Serial.print(i2cErrorStr(errProbe));
+    Serial.println(F(") │"));
+    if (pcfAlt) {
+      Serial.print(F("  │ Подсказка: чип на 0x"));
+      Serial.print(pcfAlt, HEX);
+      Serial.println(F(" — проверьте A0-A2 │"));
+    }
+  }
+
+  // 3) Тест записи ЦАП
+  if (errProbe == 0) {
+    uint8_t errW = dacWrite(DAC_CLOSED);
+    Serial.print(F("  │ Запись ЦАП (DAC="));
+    Serial.print(DAC_CLOSED);
+    Serial.print(F("): "));
+    if (errW == 0) Serial.println(F("OK                       │"));
+    else {
+      Serial.print(i2cErrorStr(errW));
+      Serial.println(F(" │"));
+    }
+  } else {
+    Serial.println(F("  │ Запись ЦАП: пропущена (нет чипа)          │"));
+  }
+
+  // 4) Вход ДПДЗ
+  int16_t raw = readTPS();
+  float   vin = (float)raw / 1023.0f * 5.0f;
+  Serial.print(F("  │ Вход A0: ADC="));
+  Serial.print(raw);
+  Serial.print(F("  Vin="));
+  Serial.print(vin, 3);
+  Serial.println(F("V                │"));
+
+  if (raw < 5)
+    Serial.println(F("  │   ⚠ сигнал почти 0В — обрыв / нет питания? │"));
+  else if (raw > 1015)
+    Serial.println(F("  │   ⚠ сигнал почти 5В — КЗ на +5В?          │"));
+
+  Serial.print(F("  │ Поток (vs): "));
+  Serial.println(streamOn ? F("ВКЛ                         │")
+                          : F("ВЫКЛ                        │"));
+  Serial.println(F("  └──────────────────────────────────────────────┘"));
 }
 
 
@@ -264,19 +297,21 @@ char waitLine(int16_t *dacRawForKeepAlive = nullptr) {
 // ═══════════════════════════════════════════════════════════════
 
 void runCalibration() {
+  bool wasStream = streamOn;
+  streamOn = false;
+
   Serial.println();
   Serial.println(F("  ┌─ КАЛИБРОВКА ──────────────────────────────┐"));
   Serial.println(F("  │ (нажмите Enter на каждом шаге)             │"));
   Serial.println(F("  └──────────────────────────────────────────────┘"));
 
-  dacWrite(DAC_CLOSED);   // безопасный выход во время калибровки
+  dacWrite(DAC_CLOSED);
 
-  // ── Шаг 1: закрытая заслонка ──────────────────────────────
+  // ── Шаг 1 ──────────────────────────────────────────────────
   Serial.println();
   Serial.println(F("  [1/2] Переведите заслонку в ЗАКРЫТОЕ положение"));
   Serial.println(F("        Нажмите Enter когда готово..."));
 
-  // Пока ждём — показываем живые значения в той же строке
   while (Serial.available()) Serial.read();
   while (true) {
     wdt_reset();
@@ -288,7 +323,6 @@ void runCalibration() {
     Serial.print(F("V)   "));
     dacWrite(DAC_CLOSED);
 
-    // Ждём 200мс или Enter
     uint32_t t = millis();
     while (millis() - t < 200) {
       wdt_reset();
@@ -305,7 +339,7 @@ void runCalibration() {
   Serial.print(F("  (")); Serial.print((float)rClose / 1023.0f * 5.0f, 3);
   Serial.println(F("V)"));
 
-  // ── Шаг 2: полный газ ──────────────────────────────────────
+  // ── Шаг 2 ──────────────────────────────────────────────────
   Serial.println();
   Serial.println(F("  [2/2] Переведите заслонку в ПОЛНОЕ ОТКРЫТИЕ"));
   Serial.println(F("        Нажмите Enter когда готово..."));
@@ -337,13 +371,13 @@ void runCalibration() {
   Serial.print(F("  (")); Serial.print((float)rOpen / 1023.0f * 5.0f, 3);
   Serial.println(F("V)"));
 
-  // ── Проверка ───────────────────────────────────────────────
   int16_t span = abs(rOpen - rClose);
   if (span < 50) {
     Serial.print(F("\n  [ОШИБКА] Диапазон = "));
     Serial.print(span);
     Serial.println(F(" ед. — слишком мало! Проверьте подключение."));
     Serial.println(F("  Калибровка НЕ сохранена.\n"));
+    streamOn = wasStream;
     return;
   }
 
@@ -354,36 +388,45 @@ void runCalibration() {
   Serial.println();
   printCalibration();
   Serial.println(F("  Калибровка завершена!\n"));
+  streamOn = wasStream;
 }
 
 
 // ═══════════════════════════════════════════════════════════════
-//  ОБРАБОТКА КОМАНД
+//  ОБРАБОТКА КОМАНД (строка целиком)
 // ═══════════════════════════════════════════════════════════════
 
-void handleCommand(char cmd) {
-  Serial.println();   // новая строка после введённого символа
-  switch (cmd) {
-    case 'v': case 'V':
-      showVoltageMonitor();
-      break;
-    case 'c': case 'C':
-      runCalibration();
-      break;
-    case 's': case 'S':
-      printCalibration();
-      break;
-    case 'r': case 'R':
-      resetCalibration();
-      break;
-    case 'h': case 'H': case '?':
-      printHelp();
-      break;
-    default:
-      Serial.print(F("  Неизвестная команда: "));
-      Serial.println(cmd);
-      printHelp();
-      break;
+void handleCommand(char *cmd) {
+  // нижний регистр
+  for (char *p = cmd; *p; p++) *p = (char)tolower((unsigned char)*p);
+
+  if (strcmp(cmd, "v") == 0) {
+    printVinOnce();
+  }
+  else if (strcmp(cmd, "vs") == 0) {
+    streamOn = !streamOn;
+    Serial.print(F("  Потоковый вывод: "));
+    Serial.println(streamOn ? F("ВКЛ") : F("ВЫКЛ"));
+  }
+  else if (strcmp(cmd, "d") == 0) {
+    runDiagnostics();
+  }
+  else if (strcmp(cmd, "c") == 0) {
+    runCalibration();
+  }
+  else if (strcmp(cmd, "s") == 0) {
+    printCalibration();
+  }
+  else if (strcmp(cmd, "r") == 0) {
+    resetCalibration();
+  }
+  else if (strcmp(cmd, "h") == 0 || strcmp(cmd, "?") == 0) {
+    printHelp();
+  }
+  else {
+    Serial.print(F("  Неизвестная команда: "));
+    Serial.println(cmd);
+    printHelp();
   }
 }
 
@@ -400,13 +443,13 @@ void setup() {
   dacWrite(DAC_CLOSED);
 
   Serial.println(F("\n╔══════════════════════════════════════╗"));
-  Serial.println(F("║   TPS Adapter v1.2  (ДПДЗ → АКПП)   ║"));
+  Serial.println(F("║   TPS Adapter v1.3  (ДПДЗ → АКПП)   ║"));
   Serial.println(F("╚══════════════════════════════════════╝"));
 
   loadCalibration();
   printCalibration();
   printHelp();
-  Serial.println();
+  Serial.println(F("  (поток выкл — включить: vs)\n"));
 
   wdt_enable(WDTO_250MS);
 }
@@ -414,22 +457,32 @@ void setup() {
 void loop() {
   wdt_reset();
 
-  // ── Команда из терминала ────────────────────────────────────
-  if (Serial.available()) {
+  // ── Чтение строки команды до \n / \r ────────────────────────
+  static char   cmdBuf[16];
+  static uint8_t cmdLen = 0;
+
+  while (Serial.available()) {
     char c = (char)Serial.read();
-    // Игнорируем \r, \n и пробелы (мусор после Enter)
-    if (c != '\r' && c != '\n' && c != ' ') {
-      handleCommand(c);
+    if (c == '\r' || c == '\n') {
+      if (cmdLen > 0) {
+        cmdBuf[cmdLen] = '\0';
+        Serial.println();
+        handleCommand(cmdBuf);
+        cmdLen = 0;
+      }
+    } else if (c != ' ' && cmdLen < sizeof(cmdBuf) - 1) {
+      cmdBuf[cmdLen++] = c;
     }
-    return;   // пропустить один цикл мониторинга после команды
   }
 
-  // ── Основное преобразование ─────────────────────────────────
+  // ── Основное преобразование (всегда) ────────────────────────
   int16_t raw    = readTPS();
   uint8_t dacVal = computeDAC(raw);
   dacWrite(dacVal);
 
-  // ── Мониторинг каждые 250 мс ────────────────────────────────
+  // ── Потоковый вывод (только если vs включён) ───────────────
+  if (!streamOn) return;
+
   static uint32_t tPrint = 0;
   if (millis() - tPrint >= 250) {
     tPrint = millis();
@@ -439,11 +492,13 @@ void loop() {
                   ? 0.0f
                   : (float)(raw - rawClosed) * 100.0f / (float)span;
     pct = constrain(pct, 0.0f, 100.0f);
+    float vin  = (float)raw / 1023.0f * 5.0f;
     float vOut = (float)dacVal / 255.0f * 5.0f;
 
-    Serial.print(F("ADC_in="));  Serial.print(raw);
-    Serial.print(F("  TPS="));   Serial.print(pct, 1);  Serial.print(F("%"));
-    Serial.print(F("  DAC="));   Serial.print(dacVal);
-    Serial.print(F("  Vout≈"));  Serial.print(vOut, 2); Serial.println(F("V"));
+    Serial.print(F("ADC="));   Serial.print(raw);
+    Serial.print(F("  Vin=")); Serial.print(vin, 3); Serial.print(F("V"));
+    Serial.print(F("  TPS=")); Serial.print(pct, 1); Serial.print(F("%"));
+    Serial.print(F("  DAC=")); Serial.print(dacVal);
+    Serial.print(F("  Vout≈")); Serial.print(vOut, 2); Serial.println(F("V"));
   }
 }
