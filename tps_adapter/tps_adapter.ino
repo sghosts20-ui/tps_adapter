@@ -2,12 +2,13 @@
  * ============================================================
  *  TPS Adapter — Нештатный ДПДЗ → Блок управления АКПП
  *  Arduino Nano (АЦП) + PCF8591 (ЦАП)
- *  v1.5 — управление через Serial-терминал
+ *  v1.6 — управление через Serial-терминал
  * ============================================================
  *
  *  СХЕМА ПОДКЛЮЧЕНИЯ:
  *  ┌─────────────────────────────────────────────────────────┐
  *  │ Arduino A0    → Сигнал нештатного ДПДЗ                  │
+ *  │ Arduino A1    → ОС: PCF8591 AOUT (или выход буфера ОУ) │
  *  │ Arduino A4    → PCF8591 SDA                             │
  *  │ Arduino A5    → PCF8591 SCL                             │
  *  │ Arduino GND   → Общая масса (ДПДЗ + блок АКПП)         │
@@ -15,7 +16,8 @@
  *  │ PCF8591 VDD   → 5V Arduino                              │
  *  │ PCF8591 GND   → Общая масса                             │
  *  │ PCF8591 VREF  → 5V от блока АКПП (питание датчика)     │
- *  │ PCF8591 AOUT  → буфер ОУ → вход ДПДЗ на блок АКПП     │
+ *  │ PCF8591 AOUT  →─┬─→ Arduino A1 (обратная связь)       │
+ *  │                 └─→ буфер ОУ → вход ДПДЗ АКПП          │
  *  │ PCF8591 A0-A2 → GND  (I²C адрес 0x48)                  │
  *  │                                                         │
  *  │ ⚠ YL-40: снять LED на AOUT + перемычки P4/P5/P6.       │
@@ -24,10 +26,10 @@
  *  └─────────────────────────────────────────────────────────┘
  *
  *  КОМАНДЫ (115200 baud, line ending: Newline):
- *    v    — разово: текущее входное напряжение ДПДЗ
+ *    v    — разово: Vin (A0) + Vfb (A1, факт AOUT)
  *    vs   — вкл/выкл потоковый вывод (повторно — выкл)
- *    d    — диагностика PCF8591 / I²C
- *    t    — пошаговый тест ЦАП (мультиметр на AOUT)
+ *    d    — диагностика PCF8591 / I²C + ОС
+ *    t    — пошаговый тест ЦАП (с чтением A1)
  *    t0   — держать DAC=0   (пока не tx / t / c)
  *    t128 — держать DAC=128
  *    t255 — держать DAC=255
@@ -48,10 +50,17 @@
 // ─── PCF8591 ─────────────────────────────────────────────────
 const uint8_t PCF_ADDR = 0x48;
 
+// ─── Пины АЦП ─────────────────────────────────────────────────
+const uint8_t PIN_TPS = A0;   // вход нештатного ДПДЗ
+const uint8_t PIN_FB  = A1;   // обратная связь: факт AOUT
+
 // ─── ВЫХОДНОЙ ДИАПАЗОН ────────────────────────────────────────
 // Родной ДПДЗ АКПП: 0.47В закрыта, 4.57В открыта, VREF = 5В
 const uint8_t DAC_CLOSED = 24;   // 0.47 / 5.0 * 255 ≈ 24
 const uint8_t DAC_OPEN   = 233;  // 4.57 / 5.0 * 255 ≈ 233
+
+// Порог расхождения «ожидание ЦАП» vs «A1 факт», вольты
+const float FB_WARN_V = 0.35f;
 
 // ─── EEPROM ───────────────────────────────────────────────────
 const uint16_t EE_MAGIC   = 0;
@@ -73,10 +82,21 @@ uint8_t  lastDacCode  = 0xFF;
 //  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 // ═══════════════════════════════════════════════════════════════
 
-int16_t readTPS() {
+int16_t readAdcAvg(uint8_t pin) {
   uint32_t s = 0;
-  for (uint8_t i = 0; i < 8; i++) s += analogRead(A0);
+  for (uint8_t i = 0; i < 8; i++) s += analogRead(pin);
   return (int16_t)(s >> 3);
+}
+
+int16_t readTPS() { return readAdcAvg(PIN_TPS); }
+int16_t readFb()  { return readAdcAvg(PIN_FB);  }
+
+float adcToVolt(int16_t raw) {
+  return (float)raw / 1023.0f * 5.0f;
+}
+
+float dacExpectV(uint8_t code) {
+  return (float)code / 255.0f * 5.0f;
 }
 
 // Двойная запись — китайские клоны PCF8591 иногда «теряют» первую.
@@ -107,9 +127,9 @@ void setDacHold(uint8_t v, bool on) {
     Serial.print(F("  Удержание ЦАП: DAC="));
     Serial.print(v);
     Serial.print(F("  (~"));
-    Serial.print((float)v / 255.0f * 5.0f, 2);
+    Serial.print(dacExpectV(v), 2);
     Serial.println(F("V при VREF=5В). Выход: tx"));
-    Serial.println(F("  Пока держит — пошевелите VREF/GND/SDA/SCL и смотрите мультиметр."));
+    Serial.println(F("  Смотрите Vfb на A1; шевелите VREF/GND/SDA/SCL."));
   } else {
     Serial.println(F("  Удержание ЦАП снято — обычный режим"));
   }
@@ -201,10 +221,10 @@ void printCalibration() {
 
 void printHelp() {
   Serial.println(F("  Команды:"));
-  Serial.println(F("    v     — разово: текущее Vin ДПДЗ"));
+  Serial.println(F("    v     — разово: Vin (A0) + Vfb (A1)"));
   Serial.println(F("    vs    — вкл/выкл потоковый вывод"));
-  Serial.println(F("    d     — диагностика PCF8591 / I2C"));
-  Serial.println(F("    t     — пошаговый тест ЦАП"));
+  Serial.println(F("    d     — диагностика PCF8591 / I2C + ОС"));
+  Serial.println(F("    t     — пошаговый тест ЦАП (с A1)"));
   Serial.println(F("    t0    — держать DAC=0   (искать плавающий контакт)"));
   Serial.println(F("    t128  — держать DAC=128"));
   Serial.println(F("    t255  — держать DAC=255"));
@@ -215,12 +235,30 @@ void printHelp() {
   Serial.println(F("    h     — эта справка"));
 }
 
-// Ждём Enter, пока держим DAC и сбрасываем WDT
+// Ждём Enter, пока держим DAC; печатаем живой Vfb с A1
 void waitEnterHoldDac(uint8_t dacVal) {
   while (Serial.available()) Serial.read();
+  uint32_t tPrint = 0;
   while (true) {
     wdt_reset();
     dacWrite(dacVal);
+
+    if (millis() - tPrint >= 200) {
+      tPrint = millis();
+      float expect = dacExpectV(dacVal);
+      float vfb    = adcToVolt(readFb());
+      float dV     = vfb - expect;
+      float adV    = (dV < 0) ? -dV : dV;
+      Serial.print(F("\r        expect="));
+      Serial.print(expect, 2);
+      Serial.print(F("V  Vfb="));
+      Serial.print(vfb, 3);
+      Serial.print(F("V  dV="));
+      Serial.print(dV, 2);
+      Serial.print(F("V   "));
+      Serial.print(adV > FB_WARN_V ? F("⚠ ") : F("OK "));
+    }
+
     if (Serial.available()) {
       char c = (char)Serial.read();
       if (c == '\n' || c == '\r') break;
@@ -231,6 +269,7 @@ void waitEnterHoldDac(uint8_t dacVal) {
     wdt_reset();
     while (Serial.available()) Serial.read();
   }
+  Serial.println();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -284,9 +323,12 @@ void runDacTest() {
 
 void printVinOnce() {
   int16_t raw = readTPS();
-  float   vin = (float)raw / 1023.0f * 5.0f;
+  float   vin = adcToVolt(raw);
   uint8_t dac = computeDAC(raw);
-  float   vout = (float)dac / 255.0f * 5.0f;
+  float   expect = dacExpectV(dac);
+  float   vfb    = adcToVolt(readFb());
+  float   dV     = vfb - expect;
+  float   adV    = (dV < 0) ? -dV : dV;
 
   int32_t span = (int32_t)rawOpen - rawClosed;
   float pct = (span == 0)
@@ -294,11 +336,15 @@ void printVinOnce() {
                 : (float)(raw - rawClosed) * 100.0f / (float)span;
   pct = constrain(pct, 0.0f, 100.0f);
 
-  Serial.print(F("  ADC="));  Serial.print(raw);
-  Serial.print(F("  Vin="));  Serial.print(vin, 3); Serial.print(F("V"));
-  Serial.print(F("  TPS="));  Serial.print(pct, 1); Serial.print(F("%"));
-  Serial.print(F("  DAC="));  Serial.print(dac);
-  Serial.print(F("  Vout≈")); Serial.print(vout, 2); Serial.println(F("V"));
+  Serial.print(F("  ADC="));   Serial.print(raw);
+  Serial.print(F("  Vin="));   Serial.print(vin, 3); Serial.print(F("V"));
+  Serial.print(F("  TPS="));   Serial.print(pct, 1); Serial.print(F("%"));
+  Serial.print(F("  DAC="));   Serial.print(dac);
+  Serial.print(F("  expect=")); Serial.print(expect, 2); Serial.print(F("V"));
+  Serial.print(F("  Vfb="));   Serial.print(vfb, 3); Serial.print(F("V"));
+  Serial.print(F("  dV="));    Serial.print(dV, 2); Serial.print(F("V"));
+  if (adV > FB_WARN_V) Serial.print(F("  ⚠"));
+  Serial.println();
 }
 
 
@@ -364,9 +410,16 @@ void runDiagnostics() {
     }
   }
 
-  // 3) Тест записи ЦАП
+  // 3) Тест записи ЦАП + проверка ОС на A1
   if (errProbe == 0) {
     uint8_t errW = dacWrite(DAC_CLOSED);
+    delay(5);
+    wdt_reset();
+    float expect = dacExpectV(DAC_CLOSED);
+    float vfb    = adcToVolt(readFb());
+    float dV     = vfb - expect;
+    float adV    = (dV < 0) ? -dV : dV;
+
     Serial.print(F("  │ Запись ЦАП (DAC="));
     Serial.print(DAC_CLOSED);
     Serial.print(F("): "));
@@ -375,13 +428,21 @@ void runDiagnostics() {
       Serial.print(i2cErrorStr(errW));
       Serial.println(F(" │"));
     }
+    Serial.print(F("  │ ОС A1: expect="));
+    Serial.print(expect, 2);
+    Serial.print(F("V  Vfb="));
+    Serial.print(vfb, 3);
+    Serial.println(F("V              │"));
+    if (adV > FB_WARN_V) {
+      Serial.println(F("  │   ⚠ Vfb далеко от expect — LED/VREF/провод A1 │"));
+    }
   } else {
     Serial.println(F("  │ Запись ЦАП: пропущена (нет чипа)          │"));
   }
 
   // 4) Вход ДПДЗ
   int16_t raw = readTPS();
-  float   vin = (float)raw / 1023.0f * 5.0f;
+  float   vin = adcToVolt(raw);
   Serial.print(F("  │ Вход A0: ADC="));
   Serial.print(raw);
   Serial.print(F("  Vin="));
@@ -393,13 +454,33 @@ void runDiagnostics() {
   else if (raw > 1015)
     Serial.println(F("  │   ⚠ сигнал почти 5В — КЗ на +5В?          │"));
 
+  // 5) Проверка петли ОС: DAC=0 и DAC=255
+  if (errProbe == 0) {
+    dacWrite(0);
+    delay(5);
+    wdt_reset();
+    float v0 = adcToVolt(readFb());
+    dacWrite(255);
+    delay(5);
+    wdt_reset();
+    float v1 = adcToVolt(readFb());
+    Serial.print(F("  │ Размах ОС: DAC0→"));
+    Serial.print(v0, 2);
+    Serial.print(F("V  DAC255→"));
+    Serial.print(v1, 2);
+    Serial.println(F("V         │"));
+    if (v1 - v0 < 2.5f) {
+      Serial.println(F("  │   ⚠ узкий размах — LED AOUT / VREF / нет буфера │"));
+    }
+  }
+
   Serial.print(F("  │ Поток (vs): "));
   Serial.println(streamOn ? F("ВКЛ                         │")
                           : F("ВЫКЛ                        │"));
   Serial.print(F("  │ Сбоев I2C записи ЦАП: "));
   Serial.print(i2cFailCount);
   Serial.println(F("                  │"));
-  Serial.println(F("  │ Если AOUT то ок, то ~1.9..3.3В:            │"));
+  Serial.println(F("  │ Если Vfb то ок, то ~1.9..3.3В:             │"));
   Serial.println(F("  │   проверьте VREF/GND/Dupont, команда t0/t255│"));
   Serial.println(F("  └──────────────────────────────────────────────┘"));
 
