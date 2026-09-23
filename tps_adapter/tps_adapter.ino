@@ -659,13 +659,13 @@ void setup() {
   dacWrite(DAC_CLOSED);
 
   Serial.println(F("\n╔══════════════════════════════════════╗"));
-  Serial.println(F("║   TPS Adapter v1.5  (ДПДЗ → АКПП)   ║"));
+  Serial.println(F("║   TPS Adapter v1.6  (ДПДЗ → АКПП)   ║"));
   Serial.println(F("╚══════════════════════════════════════╝"));
 
   loadCalibration();
   printCalibration();
   printHelp();
-  Serial.println(F("  (поток выкл — vs; удержание ЦАП — t0/t255)\n"));
+  Serial.println(F("  (A1=ОС AOUT; поток — vs; удержание — t0/t255)\n"));
 
   wdt_enable(WDTO_250MS);
 }
@@ -693,47 +693,63 @@ void loop() {
 
   // ── Выход ЦАП ───────────────────────────────────────────────
   uint8_t dacVal;
+  int16_t raw = 0;
   if (holdDac) {
     dacVal = holdValue;
   } else {
-    int16_t raw = readTPS();
+    raw = readTPS();
     dacVal = computeDAC(raw);
-
-    if (streamOn) {
-      static uint32_t tPrint = 0;
-      if (millis() - tPrint >= 250) {
-        tPrint = millis();
-        int32_t span = (int32_t)rawOpen - rawClosed;
-        float pct = (span == 0)
-                      ? 0.0f
-                      : (float)(raw - rawClosed) * 100.0f / (float)span;
-        pct = constrain(pct, 0.0f, 100.0f);
-        float vin  = (float)raw / 1023.0f * 5.0f;
-        float vOut = (float)dacVal / 255.0f * 5.0f;
-
-        Serial.print(F("ADC="));   Serial.print(raw);
-        Serial.print(F("  Vin=")); Serial.print(vin, 3); Serial.print(F("V"));
-        Serial.print(F("  TPS=")); Serial.print(pct, 1); Serial.print(F("%"));
-        Serial.print(F("  DAC=")); Serial.print(dacVal);
-        Serial.print(F("  Vout≈")); Serial.print(vOut, 2); Serial.print(F("V"));
-        if (i2cFailCount) {
-          Serial.print(F("  I2Cerr=")); Serial.print(i2cFailCount);
-        }
-        Serial.println();
-      }
-    }
   }
 
   uint8_t err = dacWrite(dacVal);
-  // при удержании — раз в секунду статус, если есть сбои
+
+  // небольшая пауза перед чтением ОС (AOUT успевает установиться)
+  delayMicroseconds(200);
+  float expect = dacExpectV(dacVal);
+  float vfb    = adcToVolt(readFb());
+  float dV     = vfb - expect;
+  float adV    = (dV < 0) ? -dV : dV;
+
   if (holdDac) {
     static uint32_t tHold = 0;
-    if (millis() - tHold >= 1000) {
+    if (millis() - tHold >= 500) {
       tHold = millis();
       Serial.print(F("HOLD DAC=")); Serial.print(dacVal);
+      Serial.print(F("  expect=")); Serial.print(expect, 2); Serial.print(F("V"));
+      Serial.print(F("  Vfb=")); Serial.print(vfb, 3); Serial.print(F("V"));
+      Serial.print(F("  dV=")); Serial.print(dV, 2); Serial.print(F("V"));
       Serial.print(F("  I2C="));
       Serial.print(err == 0 ? F("OK") : i2cErrorStr(err));
-      Serial.print(F("  fails=")); Serial.println(i2cFailCount);
+      Serial.print(F("  fails=")); Serial.print(i2cFailCount);
+      if (adV > FB_WARN_V) Serial.print(F("  ⚠"));
+      Serial.println();
     }
+    return;
+  }
+
+  if (!streamOn) return;
+
+  static uint32_t tPrint = 0;
+  if (millis() - tPrint >= 250) {
+    tPrint = millis();
+    int32_t span = (int32_t)rawOpen - rawClosed;
+    float pct = (span == 0)
+                  ? 0.0f
+                  : (float)(raw - rawClosed) * 100.0f / (float)span;
+    pct = constrain(pct, 0.0f, 100.0f);
+    float vin = adcToVolt(raw);
+
+    Serial.print(F("ADC="));    Serial.print(raw);
+    Serial.print(F("  Vin="));  Serial.print(vin, 3); Serial.print(F("V"));
+    Serial.print(F("  TPS="));  Serial.print(pct, 1); Serial.print(F("%"));
+    Serial.print(F("  DAC="));  Serial.print(dacVal);
+    Serial.print(F("  expect=")); Serial.print(expect, 2); Serial.print(F("V"));
+    Serial.print(F("  Vfb="));  Serial.print(vfb, 3); Serial.print(F("V"));
+    Serial.print(F("  dV="));   Serial.print(dV, 2); Serial.print(F("V"));
+    if (adV > FB_WARN_V) Serial.print(F("  ⚠"));
+    if (i2cFailCount) {
+      Serial.print(F("  I2Cerr=")); Serial.print(i2cFailCount);
+    }
+    Serial.println();
   }
 }
